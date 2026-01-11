@@ -1,0 +1,1537 @@
+"""
+🚀 بوت التداول الذكي - إصدار متميز
+✅ إشعارات كل ساعة فقط
+✅ إشارات حقيقية فقط (لا محاكاة)
+✅ مؤشرات متقدمة: RSI + EMA + MACD
+✅ واجهة ويب متطورة
+✅ يعمل 100% على Replit
+"""
+
+import os
+import sys
+import subprocess
+import time
+from datetime import datetime, timedelta
+import warnings
+import random
+warnings.filterwarnings('ignore')
+
+print("=" * 60)
+print("🚀 بدء تشغيل بوت التداول الذكي مع مؤشرات متقدمة...")
+print("=" * 60)
+
+# تثبيت المكتبات المطلوبة
+REQUIRED_PACKAGES = ['flask', 'requests', 'yfinance', 'pandas', 'numpy', 'ta']
+
+for package in REQUIRED_PACKAGES:
+    try:
+        __import__(package.replace('-', '_'))
+        print(f"✅ {package} مثبت")
+    except ImportError:
+        print(f"📥 جاري تثبيت {package}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet"])
+
+print("\n📁 استيراد المكتبات...")
+
+import pandas as pd
+import numpy as np
+import requests
+import ta  # مكتبة المؤشرات الفنية
+from flask import Flask, jsonify, render_template_string
+from threading import Thread, Lock
+
+# استيراد yfinance
+try:
+    import yfinance as yf
+    YF_WORKING = True
+    print("✅ yfinance مثبت")
+except:
+    YF_WORKING = False
+    print("⚠️ yfinance فيه مشكلة")
+
+print("✅ جميع المكتبات جاهزة!")
+
+# ================== إعدادات Telegram ==================
+TELEGRAM_TOKEN = "8182359938:AAGX1i_MkGtRnfaCgvEeswSzD13Ydde-nLA"
+TELEGRAM_CHAT_ID = "926218869"
+TELEGRAM_ENABLED = True
+
+# ================== إعدادات التوقيت ==================
+HOURLY_REPORT_INTERVAL = 3600  # كل ساعة (3600 ثانية)
+MIN_SIGNAL_STRENGTH = 70      # الحد الأدنى لقوة الإشارة (من 100)
+PRICE_UPDATE_INTERVAL = 300   # تحديث الأسعار كل 5 دقائق
+
+# ================== النظام الرئيسي ==================
+
+app = Flask(__name__)
+
+# بيانات البوت
+current_prices = {
+    'gold': {'price': 0, 'rsi': 50, 'ema_short': 0, 'ema_long': 0, 'macd': 0, 'macd_signal': 0, 
+             'trend': 'محايد', 'signal_strength': 0, 'indicators': {}},
+    'btc': {'price': 0, 'rsi': 50, 'ema_short': 0, 'ema_long': 0, 'macd': 0, 'macd_signal': 0,
+            'trend': 'محايد', 'signal_strength': 0, 'indicators': {}},
+    'silver': {'price': 0, 'rsi': 50, 'ema_short': 0, 'ema_long': 0, 'macd': 0, 'macd_signal': 0,
+               'trend': 'محايد', 'signal_strength': 0, 'indicators': {}}
+}
+
+trading_signals = []
+last_hourly_report = None
+last_price_update = None
+signal_lock = Lock()
+
+class AdvancedTradingBot:
+    def __init__(self):
+        self.running = True
+        self.price_history = {
+            'gold': [],
+            'btc': [],
+            'silver': []
+        }
+        self.full_price_data = {
+            'gold': pd.DataFrame(),
+            'btc': pd.DataFrame(),
+            'silver': pd.DataFrame()
+        }
+        self.history_length = 100
+        
+        # إعدادات المؤشرات
+        self.ema_short_period = 12
+        self.ema_long_period = 26
+        self.macd_fast = 12
+        self.macd_slow = 26
+        self.macd_signal_period = 9
+        self.rsi_period = 14
+
+        # تتبع الإشارات المرسلة
+        self.sent_signals_today = set()
+        self.last_signal_time = {}
+
+    def send_telegram(self, message):
+        """إرسال رسالة إلى Telegram"""
+        if not TELEGRAM_ENABLED:
+            return False
+
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            data = {
+                'chat_id': TELEGRAM_CHAT_ID,
+                'text': message,
+                'parse_mode': 'HTML'
+            }
+            response = requests.post(url, json=data, timeout=10)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"⚠️ خطأ في إرسال Telegram: {e}")
+            return False
+
+    def should_send_hourly_report(self):
+        """فحص إذا حان وقت الإرسال الساعي"""
+        global last_hourly_report
+
+        now = datetime.now()
+        if last_hourly_report is None:
+            last_hourly_report = now
+            return True
+
+        time_diff = (now - last_hourly_report).total_seconds()
+        return time_diff >= HOURLY_REPORT_INTERVAL
+
+    def send_hourly_report(self):
+        """إرسال تقرير كل ساعة"""
+        global last_hourly_report
+
+        try:
+            report_time = datetime.now().strftime("%H:%M:%S")
+            report_date = datetime.now().strftime("%Y-%m-%d")
+
+            # تحضير تقرير المؤشرات
+            indicators_report = ""
+            for asset, data in current_prices.items():
+                if data['price'] > 0:
+                    name = {'gold': 'الذهب', 'btc': 'البيتكوين', 'silver': 'الفضة'}[asset]
+                    ema_status = "🟢" if data['ema_short'] > data['ema_long'] else "🔴"
+                    macd_status = "🟢" if data['macd'] > data['macd_signal'] else "🔴"
+                    rsi_status = "🟢" if data['rsi'] < 40 else "🔴" if data['rsi'] > 60 else "⚪"
+                    
+                    indicators_report += f"""
+• {name}:
+  EMA: {ema_status} | MACD: {macd_status} | RSI: {rsi_status} ({data['rsi']})
+                    """
+
+            report_msg = f"""⏰ <b>تقرير النظام - كل ساعة</b>
+
+📊 <b>حالة النظام:</b> ✅ يعمل بنجاح
+⏰ <b>الوقت:</b> {report_time}
+📅 <b>التاريخ:</b> {report_date}
+
+📈 <b>آخر تحديث للأسعار:</b>
+• الذهب: ${current_prices['gold']['price']:,.2f}
+• البيتكوين: ${current_prices['btc']['price']:,.2f}
+• الفضة: ${current_prices['silver']['price']:,.2f}
+
+📊 <b>حالة المؤشرات:</b>
+{indicators_report}
+
+🎯 <b>آخر إشارة:</b> {len(trading_signals)} إشارة اليوم
+
+🤖 <b>ملاحظة:</b>
+البوت يراقب الأسواق بـ 3 مؤشرات فنية:
+RSI + EMA + MACD
+
+#تقرير_ساعي #مراقبة_الأسواق"""
+
+            if self.send_telegram(report_msg):
+                print(f"✅ تم إرسال التقرير الساعي ({report_time})")
+                last_hourly_report = datetime.now()
+                return True
+            else:
+                print("⚠️ فشل إرسال التقرير الساعي")
+                return False
+
+        except Exception as e:
+            print(f"❌ خطأ في إرسال التقرير الساعي: {e}")
+            return False
+
+    def get_real_price(self, symbol_type, asset):
+        """جلب سعر حقيقي مع بيانات تاريخية للمؤشرات"""
+        try:
+            if not YF_WORKING:
+                return None, "yfinance غير متوفر", None
+
+            ticker_map = {
+                'gold': ['GC=F', 'XAUUSD=X'],
+                'btc': ['BTC-USD', 'BTC-USD'],
+                'silver': ['SI=F', 'XAGUSD=X']
+            }
+
+            symbols = ticker_map.get(asset, [])
+            for symbol in symbols:
+                try:
+                    ticker = yf.Ticker(symbol)
+                    
+                    # جلب بيانات تاريخية أكثر للمؤشرات
+                    hist = ticker.history(period='1mo', interval='1h')
+                    
+                    if not hist.empty and len(hist) > 50:
+                        price = float(hist['Close'].iloc[-1])
+                        
+                        # تحويل إذا كان ETF
+                        if symbol in ['GLD']:
+                            price = price * 10
+                        elif symbol in ['SLV']:
+                            price = price * 50
+                        
+                        return price, f"Yahoo Finance ({symbol})", hist
+                        
+                except Exception as e:
+                    continue
+
+            return None, "لا توجد بيانات", None
+
+        except Exception as e:
+            print(f"⚠️ خطأ في جلب سعر {asset}: {e}")
+            return None, f"خطأ: {str(e)[:50]}", None
+
+    def calculate_technical_indicators(self, price_data, current_price):
+        """حساب جميع المؤشرات الفنية"""
+        if price_data is None or len(price_data) < 50:
+            return {
+                'rsi': 50,
+                'ema_short': current_price,
+                'ema_long': current_price,
+                'macd': 0,
+                'macd_signal': 0,
+                'macd_histogram': 0,
+                'trend_ema': 'محايد',
+                'trend_macd': 'محايد',
+                'trend_rsi': 'محايد'
+            }
+
+        try:
+            df = price_data.copy()
+            
+            # حساب RSI
+            rsi_indicator = ta.momentum.RSIIndicator(
+                close=df['Close'], 
+                window=self.rsi_period
+            )
+            rsi = rsi_indicator.rsi().iloc[-1]
+            
+            # حساب EMA
+            ema_short = ta.trend.EMAIndicator(
+                close=df['Close'], 
+                window=self.ema_short_period
+            ).ema_indicator().iloc[-1]
+            
+            ema_long = ta.trend.EMAIndicator(
+                close=df['Close'], 
+                window=self.ema_long_period
+            ).ema_indicator().iloc[-1]
+            
+            # حساب MACD
+            macd_indicator = ta.trend.MACD(
+                close=df['Close'],
+                window_slow=self.macd_slow,
+                window_fast=self.macd_fast,
+                window_sign=self.macd_signal_period
+            )
+            macd = macd_indicator.macd().iloc[-1]
+            macd_signal = macd_indicator.macd_signal().iloc[-1]
+            macd_histogram = macd_indicator.macd_diff().iloc[-1]
+            
+            # تحديد الاتجاهات
+            trend_ema = "صاعد" if ema_short > ema_long else "هابط" if ema_short < ema_long else "محايد"
+            trend_macd = "صاعد" if macd > macd_signal else "هابط" if macd < macd_signal else "محايد"
+            
+            if rsi < 30:
+                trend_rsi = "مشترى قوي"
+            elif rsi < 40:
+                trend_rsi = "مشترى"
+            elif rsi > 70:
+                trend_rsi = "بيع قوي"
+            elif rsi > 60:
+                trend_rsi = "بيع"
+            else:
+                trend_rsi = "محايد"
+
+            return {
+                'rsi': round(rsi, 2),
+                'ema_short': round(ema_short, 2) if not pd.isna(ema_short) else current_price,
+                'ema_long': round(ema_long, 2) if not pd.isna(ema_long) else current_price,
+                'macd': round(macd, 4) if not pd.isna(macd) else 0,
+                'macd_signal': round(macd_signal, 4) if not pd.isna(macd_signal) else 0,
+                'macd_histogram': round(macd_histogram, 4) if not pd.isna(macd_histogram) else 0,
+                'trend_ema': trend_ema,
+                'trend_macd': trend_macd,
+                'trend_rsi': trend_rsi
+            }
+
+        except Exception as e:
+            print(f"⚠️ خطأ في حساب المؤشرات: {e}")
+            return {
+                'rsi': 50,
+                'ema_short': current_price,
+                'ema_long': current_price,
+                'macd': 0,
+                'macd_signal': 0,
+                'macd_histogram': 0,
+                'trend_ema': 'محايد',
+                'trend_macd': 'محايد',
+                'trend_rsi': 'محايد'
+            }
+
+    def calculate_signal_strength(self, indicators, current_price):
+        """حساب قوة الإشارة بناءً على المؤشرات الثلاثة"""
+        try:
+            strength_components = []
+            
+            # 1. قوة RSI (الوزن: 35%)
+            rsi = indicators['rsi']
+            if rsi < 30:
+                rsi_strength = 95
+            elif rsi < 35:
+                rsi_strength = 85
+            elif rsi < 40:
+                rsi_strength = 75
+            elif rsi > 70:
+                rsi_strength = 95
+            elif rsi > 65:
+                rsi_strength = 85
+            elif rsi > 60:
+                rsi_strength = 75
+            else:
+                rsi_strength = 50
+            strength_components.append(('RSI', rsi_strength, 0.35))
+            
+            # 2. قوة EMA (الوزن: 35%)
+            ema_diff = ((indicators['ema_short'] - indicators['ema_long']) / indicators['ema_long']) * 100
+            if indicators['ema_short'] > indicators['ema_long']:
+                if ema_diff > 2:
+                    ema_strength = 90
+                elif ema_diff > 1:
+                    ema_strength = 80
+                elif ema_diff > 0.5:
+                    ema_strength = 70
+                else:
+                    ema_strength = 60
+            else:
+                if ema_diff < -2:
+                    ema_strength = 90
+                elif ema_diff < -1:
+                    ema_strength = 80
+                elif ema_diff < -0.5:
+                    ema_strength = 70
+                else:
+                    ema_strength = 60
+            strength_components.append(('EMA', ema_strength, 0.35))
+            
+            # 3. قوة MACD (الوزن: 30%)
+            macd_hist = indicators['macd_histogram']
+            if macd_hist > 0:
+                if macd_hist > 0.01:
+                    macd_strength = 90
+                elif macd_hist > 0.005:
+                    macd_strength = 80
+                elif macd_hist > 0.001:
+                    macd_strength = 70
+                else:
+                    macd_strength = 60
+            else:
+                if macd_hist < -0.01:
+                    macd_strength = 90
+                elif macd_hist < -0.005:
+                    macd_strength = 80
+                elif macd_hist < -0.001:
+                    macd_strength = 70
+                else:
+                    macd_strength = 60
+            strength_components.append(('MACD', macd_strength, 0.30))
+            
+            # حساب القوة الإجمالية الموزونة
+            total_strength = 0
+            for name, strength, weight in strength_components:
+                total_strength += strength * weight
+            
+            # تحديد الاتجاه العام
+            buy_signals = 0
+            sell_signals = 0
+            
+            if rsi < 40:
+                buy_signals += 1
+            elif rsi > 60:
+                sell_signals += 1
+                
+            if indicators['ema_short'] > indicators['ema_long']:
+                buy_signals += 1
+            else:
+                sell_signals += 1
+                
+            if indicators['macd'] > indicators['macd_signal']:
+                buy_signals += 1
+            else:
+                sell_signals += 1
+            
+            if buy_signals >= 2:
+                trend = "صاعد"
+                signal_type = "شراء"
+                # زيادة القوة إذا كان هناك توافق بين المؤشرات
+                if buy_signals == 3:
+                    total_strength = min(total_strength * 1.15, 100)
+            elif sell_signals >= 2:
+                trend = "هابط"
+                signal_type = "بيع"
+                if sell_signals == 3:
+                    total_strength = min(total_strength * 1.15, 100)
+            else:
+                trend = "محايد"
+                signal_type = "انتظار"
+                total_strength = max(total_strength * 0.7, 30)
+            
+            return {
+                'total_strength': round(total_strength, 1),
+                'trend': trend,
+                'signal_type': signal_type,
+                'components': strength_components,
+                'buy_signals': buy_signals,
+                'sell_signals': sell_signals
+            }
+            
+        except Exception as e:
+            print(f"⚠️ خطأ في حساب قوة الإشارة: {e}")
+            return {
+                'total_strength': 50,
+                'trend': 'محايد',
+                'signal_type': 'انتظار',
+                'components': [],
+                'buy_signals': 0,
+                'sell_signals': 0
+            }
+
+    def analyze_asset_with_indicators(self, asset_key, asset_name):
+        """تحليل أصل باستخدام المؤشرات الثلاثة"""
+        try:
+            # جلب السعر والبيانات التاريخية
+            price, source, historical_data = self.get_real_price(
+                'forex' if asset_key in ['gold', 'silver'] else 'crypto', 
+                asset_key
+            )
+
+            if price is None or historical_data is None:
+                return None
+
+            # تحديث البيانات
+            self.full_price_data[asset_key] = historical_data
+            
+            # حساب جميع المؤشرات
+            indicators = self.calculate_technical_indicators(historical_data, price)
+            
+            # حساب قوة الإشارة
+            signal_info = self.calculate_signal_strength(indicators, price)
+            
+            # تحديث البيانات الحالية
+            current_prices[asset_key] = {
+                'price': price,
+                'rsi': indicators['rsi'],
+                'ema_short': indicators['ema_short'],
+                'ema_long': indicators['ema_long'],
+                'macd': indicators['macd'],
+                'macd_signal': indicators['macd_signal'],
+                'macd_histogram': indicators['macd_histogram'],
+                'trend': signal_info['trend'],
+                'signal_strength': signal_info['total_strength'],
+                'indicators': {
+                    'rsi_trend': indicators['trend_rsi'],
+                    'ema_trend': indicators['trend_ema'],
+                    'macd_trend': indicators['trend_macd'],
+                    'signal_type': signal_info['signal_type'],
+                    'buy_signals': signal_info['buy_signals'],
+                    'sell_signals': signal_info['sell_signals'],
+                    'strength_components': signal_info['components']
+                }
+            }
+
+            # التحقق من قوة الإشارة
+            if signal_info['total_strength'] < MIN_SIGNAL_STRENGTH:
+                return None
+
+            # التحقق من التكرار
+            signal_key = f"{asset_key}_{indicators['rsi']}_{indicators['ema_short']}_{indicators['macd']}"
+            today = datetime.now().strftime("%Y-%m-%d")
+            daily_key = f"{signal_key}_{today}"
+
+            if daily_key in self.sent_signals_today:
+                return None
+
+            # إنشاء إشارة مفصلة
+            signal_type = signal_info['signal_type']
+            if signal_type == "شراء":
+                if signal_info['buy_signals'] == 3:
+                    action = 'شراء قوي جداً 🟢🟢'
+                    reason = f'✅ توافق كامل بين المؤشرات الثلاثة\n📊 RSI: {indicators["rsi"]} (مشترى)\n📈 EMA: {indicators["trend_ema"]}\n🎯 MACD: {indicators["trend_macd"]}'
+                else:
+                    action = 'شراء 🟢'
+                    reason = f'✅ {signal_info["buy_signals"]}/3 مؤشرات تشير للشراء\n📊 RSI: {indicators["rsi"]}\n📈 EMA: {indicators["trend_ema"]}\n🎯 MACD: {indicators["trend_macd"]}'
+                    
+            elif signal_type == "بيع":
+                if signal_info['sell_signals'] == 3:
+                    action = 'بيع قوي جداً 🔴🔴'
+                    reason = f'❌ توافق كامل بين المؤشرات الثلاثة\n📊 RSI: {indicators["rsi"]} (بيع)\n📈 EMA: {indicators["trend_ema"]}\n🎯 MACD: {indicators["trend_macd"]}'
+                else:
+                    action = 'بيع 🔴'
+                    reason = f'❌ {signal_info["sell_signals"]}/3 مؤشرات تشير للبيع\n📊 RSI: {indicators["rsi"]}\n📈 EMA: {indicators["trend_ema"]}\n🎯 MACD: {indicators["trend_macd"]}'
+            else:
+                return None
+
+            signal = {
+                'asset': asset_key,
+                'name': asset_name,
+                'price': price,
+                'action': action,
+                'strength_score': signal_info['total_strength'],
+                'reason': reason,
+                'rsi': indicators['rsi'],
+                'ema_short': indicators['ema_short'],
+                'ema_long': indicators['ema_long'],
+                'macd': indicators['macd'],
+                'macd_signal': indicators['macd_signal'],
+                'macd_histogram': indicators['macd_histogram'],
+                'trend_rsi': indicators['trend_rsi'],
+                'trend_ema': indicators['trend_ema'],
+                'trend_macd': indicators['trend_macd'],
+                'buy_signals': signal_info['buy_signals'],
+                'sell_signals': signal_info['sell_signals'],
+                'time': datetime.now().strftime("%H:%M:%S"),
+                'date': today,
+                'source': source
+            }
+
+            # إضافة للتتبع
+            self.sent_signals_today.add(daily_key)
+            if len(self.sent_signals_today) > 50:
+                self.sent_signals_today = set(list(self.sent_signals_today)[-30:])
+
+            return signal
+
+        except Exception as e:
+            print(f"⚠️ خطأ في تحليل {asset_name}: {e}")
+            return None
+
+    def send_advanced_signal_to_telegram(self, signal):
+        """إرسال إشارة متقدمة إلى Telegram"""
+        try:
+            emoji = "🟢🟢" if "قوي جداً" in signal['action'] else "🟢" if "شراء" in signal['action'] else "🔴🔴" if "قوي جداً" in signal['action'] else "🔴"
+            
+            # تفاصيل المؤشرات
+            indicators_details = f"""
+📊 <b>تفاصيل المؤشرات:</b>
+• RSI: {signal['rsi']} ({signal['trend_rsi']})
+• EMA: {signal['trend_ema']} ({signal['ema_short']:.2f}/{signal['ema_long']:.2f})
+• MACD: {signal['trend_macd']} ({signal['macd']:.4f}/{signal['macd_signal']:.4f})
+
+🎯 <b>توصيات المؤشرات:</b>
+• {signal['buy_signals']}/3 مؤشرات للشراء
+• {signal['sell_signals']}/3 مؤشرات للبيع"""
+
+            message = f"""
+{emoji} <b>🎯 إشارة تداول متقدمة!</b> {emoji}
+
+🏦 <b>الأصل:</b> {signal['name']}
+🎯 <b>الإجراء:</b> {signal['action']}
+💪 <b>قوة الإشارة:</b> {signal['strength_score']}/100
+
+💰 <b>السعر الحالي:</b> ${signal['price']:,.2f}
+{indicators_details}
+
+📝 <b>التحليل:</b>
+{signal['reason']}
+
+🔍 <b>مصدر البيانات:</b> {signal['source']}
+⏰ <b>الوقت:</b> {signal['time']}
+📅 <b>التاريخ:</b> {signal['date']}
+
+⚠️ <b>ملاحظة:</b>
+هذه إشارة بناءً على تحليل 3 مؤشرات فنية
+RSI + EMA + MACD
+
+#{signal['asset']} #تداول_متقدم #إشارة_حقيقية
+            """
+
+            if self.send_telegram(message):
+                print(f"✅ تم إرسال إشارة متقدمة: {signal['name']} - {signal['action']}")
+                return True
+            else:
+                print(f"⚠️ فشل إرسال إشارة: {signal['name']}")
+                return False
+
+        except Exception as e:
+            print(f"❌ خطأ في إرسال الإشارة: {e}")
+            return False
+
+    def update_all_prices_with_indicators(self):
+        """تحديث جميع الأسعار مع المؤشرات"""
+        try:
+            assets = [
+                ('gold', 'الذهب'),
+                ('btc', 'البيتكوين'),
+                ('silver', 'الفضة')
+            ]
+            
+            for asset_key, asset_name in assets:
+                price, source, historical_data = self.get_real_price(
+                    'forex' if asset_key in ['gold', 'silver'] else 'crypto',
+                    asset_key
+                )
+                
+                if price and historical_data is not None:
+                    self.full_price_data[asset_key] = historical_data
+                    
+                    indicators = self.calculate_technical_indicators(historical_data, price)
+                    signal_info = self.calculate_signal_strength(indicators, price)
+                    
+                    current_prices[asset_key] = {
+                        'price': price,
+                        'rsi': indicators['rsi'],
+                        'ema_short': indicators['ema_short'],
+                        'ema_long': indicators['ema_long'],
+                        'macd': indicators['macd'],
+                        'macd_signal': indicators['macd_signal'],
+                        'macd_histogram': indicators['macd_histogram'],
+                        'trend': signal_info['trend'],
+                        'signal_strength': signal_info['total_strength'],
+                        'indicators': {
+                            'rsi_trend': indicators['trend_rsi'],
+                            'ema_trend': indicators['trend_ema'],
+                            'macd_trend': indicators['trend_macd'],
+                            'signal_type': signal_info['signal_type'],
+                            'buy_signals': signal_info['buy_signals'],
+                            'sell_signals': signal_info['sell_signals']
+                        }
+                    }
+
+            return True
+
+        except Exception as e:
+            print(f"❌ خطأ في تحديث الأسعار: {e}")
+            return False
+
+    def run(self):
+        """تشغيل البوت الرئيسي"""
+        print("\n🤖 بوت التداول الذكي - الإصدار المتقدم")
+        print("📊 المميزات:")
+        print("   • 📈 3 مؤشرات فنية: RSI + EMA + MACD")
+        print("   • ⏰ تقرير ساعي فقط")
+        print("   • 🎯 إشارات حقيقية فقط (قوة > 70/100)")
+        print("   • 🤖 إشعارات Telegram متقدمة")
+        print("=" * 60)
+
+        if TELEGRAM_ENABLED:
+            start_msg = f"""🚀 <b>بوت التداول المتقدم يعمل الآن!</b>
+
+📊 <b>المميزات الجديدة:</b>
+• 3 مؤشرات فنية متقدمة
+• تحليل RSI لتحديد التشبع
+• تحليل EMA لتحديد الاتجاه
+• تحليل MACD للزخم
+
+🎯 <b>سيتم إرسال:</b>
+1. تقرير كل ساعة مع حالة المؤشرات
+2. إشارات عند توافق المؤشرات
+
+⚙️ <b>إعدادات المؤشرات:</b>
+• RSI: 14 فترة
+• EMA: 12 و 26 فترة
+• MACD: 12, 26, 9
+
+⏰ {datetime.now().strftime("%H:%M:%S")}
+📅 {datetime.now().strftime("%Y-%m-%d")}
+
+#بدء_التشغيل #بوت_متقدم"""
+
+            self.send_telegram(start_msg)
+
+        cycle = 0
+        price_update_counter = 0
+
+        while self.running:
+            try:
+                cycle += 1
+                print(f"\n🔄 الدورة #{cycle}")
+                print(f"⏰ {datetime.now().strftime('%H:%M:%S')}")
+
+                # 1. التحقق من التقرير الساعي
+                if self.should_send_hourly_report():
+                    self.send_hourly_report()
+
+                # 2. تحديث الأسعار والمؤشرات
+                price_update_counter += 1
+                if price_update_counter >= (PRICE_UPDATE_INTERVAL / 30):
+                    print("📈 جاري تحديث الأسعار والمؤشرات...")
+                    self.update_all_prices_with_indicators()
+                    price_update_counter = 0
+
+                # 3. البحث عن إشارات باستخدام المؤشرات
+                real_signals = []
+
+                for asset_key, asset_name in [('gold', 'الذهب'), ('btc', 'البيتكوين'), ('silver', 'الفضة')]:
+                    signal = self.analyze_asset_with_indicators(asset_key, asset_name)
+                    if signal:
+                        real_signals.append(signal)
+
+                # 4. إرسال الإشارات القوية
+                if real_signals:
+                    print(f"🎯 تم اكتشاف {len(real_signals)} إشارة قوية")
+
+                    for signal in real_signals:
+                        with signal_lock:
+                            trading_signals.append(signal)
+                            if len(trading_signals) > 20:
+                                trading_signals.pop(0)
+
+                        if TELEGRAM_ENABLED:
+                            self.send_advanced_signal_to_telegram(signal)
+
+                        print(f"   📢 {signal['name']}: {signal['action']} (قوة: {signal['strength_score']}/100)")
+                        print(f"     📊 RSI: {signal['rsi']} | 📈 EMA: {signal['trend_ema']} | 🎯 MACD: {signal['trend_macd']}")
+                else:
+                    print("📭 لا توجد إشارات قوية حالياً")
+
+                # 5. عرض حالة المؤشرات
+                print(f"\n📊 حالة المؤشرات:")
+                for asset, data in current_prices.items():
+                    name = {'gold': 'الذهب', 'btc': 'البيتكوين', 'silver': 'الفضة'}[asset]
+                    if data['price'] > 0:
+                        strength_indicator = "🔴" if data['signal_strength'] >= 70 else "🟡" if data['signal_strength'] >= 50 else "🟢"
+                        indicators_status = f"RSI:{data['rsi']} EMA:{data['indicators']['ema_trend']} MACD:{data['indicators']['macd_trend']}"
+                        print(f"   • {name}: ${data['price']:,.2f} | قوة: {data['signal_strength']}/100 {strength_indicator}")
+                        print(f"     📊 {indicators_status}")
+
+                print(f"\n⏳ انتظار 30 ثانية...")
+                time.sleep(30)
+
+            except KeyboardInterrupt:
+                print("\n🛑 إيقاف البوت...")
+                self.running = False
+                break
+            except Exception as e:
+                print(f"❌ خطأ غير متوقع: {e}")
+                time.sleep(30)
+
+# إنشاء البوت المتقدم
+bot = AdvancedTradingBot()
+
+# ================== واجهة الويب المتقدمة ==================
+
+@app.route('/')
+def advanced_dashboard():
+    """لوحة التحكم المتقدمة"""
+    html = '''
+    <!DOCTYPE html>
+    <html dir="rtl">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>بوت التداول الذكي - الإصدار المتقدم</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            }
+
+            body {
+                background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+                color: #e2e8f0;
+                min-height: 100vh;
+                padding: 20px;
+            }
+
+            .container {
+                max-width: 1600px;
+                margin: 0 auto;
+            }
+
+            .header {
+                text-align: center;
+                padding: 40px 20px;
+                background: linear-gradient(90deg, #7c3aed 0%, #4f46e5 100%);
+                border-radius: 20px;
+                margin-bottom: 40px;
+                box-shadow: 0 10px 30px rgba(124, 58, 237, 0.3);
+                position: relative;
+                overflow: hidden;
+            }
+
+            .header::before {
+                content: "📊";
+                position: absolute;
+                font-size: 150px;
+                opacity: 0.1;
+                right: -30px;
+                top: -30px;
+            }
+
+            .header h1 {
+                font-size: 2.8rem;
+                margin-bottom: 10px;
+                background: linear-gradient(90deg, #fbbf24 0%, #f59e0b 100%);
+                -webkit-background-clip: text;
+                background-clip: text;
+                color: transparent;
+            }
+
+            .badges-container {
+                display: flex;
+                justify-content: center;
+                flex-wrap: wrap;
+                gap: 10px;
+                margin-top: 20px;
+            }
+
+            .badge {
+                display: inline-block;
+                padding: 8px 20px;
+                border-radius: 50px;
+                font-weight: bold;
+                font-size: 0.9rem;
+                border: 2px solid;
+            }
+
+            .badge-success { background: #10b981; color: white; border-color: #10b981; }
+            .badge-indicator { background: #3b82f6; color: white; border-color: #3b82f6; }
+            .badge-warning { background: #f59e0b; color: white; border-color: #f59e0b; }
+            .badge-danger { background: #ef4444; color: white; border-color: #ef4444; }
+
+            .indicators-header {
+                text-align: center;
+                margin: 30px 0;
+                padding: 20px;
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 15px;
+            }
+
+            .indicator-item {
+                display: inline-block;
+                margin: 0 15px;
+                text-align: center;
+            }
+
+            .indicator-icon {
+                font-size: 2.5rem;
+                margin-bottom: 10px;
+            }
+
+            .cards-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+                gap: 25px;
+                margin-bottom: 40px;
+            }
+
+            .card {
+                background: rgba(30, 41, 59, 0.7);
+                backdrop-filter: blur(10px);
+                border-radius: 15px;
+                padding: 25px;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                transition: all 0.3s;
+            }
+
+            .card:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 15px 35px rgba(0, 0, 0, 0.3);
+            }
+
+            .price {
+                font-size: 2.5rem;
+                font-weight: bold;
+                margin: 15px 0;
+                color: #fbbf24;
+            }
+
+            .indicators-grid {
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 15px;
+                margin: 20px 0;
+            }
+
+            .indicator-box {
+                background: rgba(255, 255, 255, 0.05);
+                padding: 15px;
+                border-radius: 10px;
+                text-align: center;
+            }
+
+            .indicator-value {
+                font-size: 1.2rem;
+                font-weight: bold;
+                margin: 5px 0;
+            }
+
+            .signal-card {
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 10px;
+                padding: 20px;
+                margin: 15px 0;
+                border-left: 5px solid;
+                position: relative;
+                overflow: hidden;
+            }
+
+            .signal-card::before {
+                content: "";
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                height: 3px;
+                background: currentColor;
+                opacity: 0.3;
+            }
+
+            .signal-buy { border-color: #10b981; color: #10b981; }
+            .signal-sell { border-color: #ef4444; color: #ef4444; }
+
+            .signal-indicators {
+                display: flex;
+                gap: 10px;
+                margin: 10px 0;
+                flex-wrap: wrap;
+            }
+
+            .signal-indicator {
+                padding: 5px 10px;
+                border-radius: 5px;
+                font-size: 0.9rem;
+                background: rgba(255, 255, 255, 0.1);
+            }
+
+            .stats {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 20px;
+                background: rgba(255,255,255,0.05);
+                padding: 25px;
+                border-radius: 15px;
+                margin: 30px 0;
+            }
+
+            .stat-item {
+                text-align: center;
+                padding: 15px;
+                background: rgba(255,255,255,0.03);
+                border-radius: 10px;
+            }
+
+            .stat-value {
+                font-size: 2rem;
+                font-weight: bold;
+                color: #60a5fa;
+                margin: 10px 0;
+            }
+
+            .controls {
+                text-align: center;
+                margin: 30px 0;
+            }
+
+            .btn {
+                padding: 12px 30px;
+                border-radius: 10px;
+                border: none;
+                cursor: pointer;
+                font-weight: bold;
+                font-size: 1.1rem;
+                margin: 10px;
+                transition: all 0.3s;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 10px;
+            }
+
+            .btn-telegram { 
+                background: #0088cc; 
+                color: white;
+            }
+
+            .btn-telegram:hover {
+                background: #006699;
+                transform: scale(1.05);
+            }
+
+            .btn-indicator {
+                background: #7c3aed;
+                color: white;
+            }
+
+            .btn-indicator:hover {
+                background: #6d28d9;
+                transform: scale(1.05);
+            }
+
+            .strength-meter {
+                height: 12px;
+                background: rgba(255,255,255,0.1);
+                border-radius: 6px;
+                margin: 15px 0;
+                overflow: hidden;
+                position: relative;
+            }
+
+            .strength-fill {
+                height: 100%;
+                border-radius: 6px;
+                transition: width 0.5s;
+                position: relative;
+                overflow: hidden;
+            }
+
+            .strength-fill::after {
+                content: "";
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: linear-gradient(90deg, 
+                    transparent 0%, 
+                    rgba(255,255,255,0.2) 50%, 
+                    transparent 100%);
+                animation: shine 2s infinite;
+            }
+
+            @keyframes shine {
+                0% { transform: translateX(-100%); }
+                100% { transform: translateX(100%); }
+            }
+
+            .strength-low { background: linear-gradient(90deg, #10b981, #34d399); }
+            .strength-medium { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+            .strength-high { background: linear-gradient(90deg, #ef4444, #f87171); }
+
+            .time-badge {
+                position: absolute;
+                top: 15px;
+                left: 15px;
+                padding: 5px 15px;
+                border-radius: 20px;
+                background: rgba(0,0,0,0.3);
+                font-size: 0.9rem;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🤖 بوت التداول الذكي المتقدم</h1>
+                <p>3 مؤشرات فنية: RSI + EMA + MACD</p>
+                <div class="badges-container">
+                    <div class="badge badge-success">✅ يعمل حالياً</div>
+                    <div class="badge badge-indicator">📊 3 مؤشرات</div>
+                    <div class="badge badge-warning">⏰ تقرير ساعي</div>
+                    <div class="badge badge-danger">🎯 إشارات حقيقية</div>
+                </div>
+            </div>
+
+            <div class="indicators-header">
+                <h2>📈 المؤشرات الفنية المستخدمة</h2>
+                <div style="margin-top: 20px;">
+                    <div class="indicator-item">
+                        <div class="indicator-icon">📊</div>
+                        <div><strong>RSI</strong></div>
+                        <small>14 فترة</small>
+                    </div>
+                    <div class="indicator-item">
+                        <div class="indicator-icon">📈</div>
+                        <div><strong>EMA</strong></div>
+                        <small>12 و 26 فترة</small>
+                    </div>
+                    <div class="indicator-item">
+                        <div class="indicator-icon">🎯</div>
+                        <div><strong>MACD</strong></div>
+                        <small>12, 26, 9</small>
+                    </div>
+                </div>
+            </div>
+
+            <div class="cards-grid" id="prices-container">
+                <!-- يتم ملؤه بواسطة JavaScript -->
+            </div>
+
+            <div class="stats">
+                <div class="stat-item">
+                    <div>📊 إشارات اليوم</div>
+                    <div class="stat-value" id="signals-count">0</div>
+                    <small>مرشحة لقوة > 70</small>
+                </div>
+                <div class="stat-item">
+                    <div>💪 متوسط القوة</div>
+                    <div class="stat-value" id="strength-avg">0</div>
+                    <small>من 100 نقطة</small>
+                </div>
+                <div class="stat-item">
+                    <div>⏰ آخر تحديث</div>
+                    <div class="stat-value" id="last-update">الآن</div>
+                    <small>آخر تحديث للبيانات</small>
+                </div>
+                <div class="stat-item">
+                    <div>🤖 حالة النظام</div>
+                    <div class="stat-value" style="color: #10b981;" id="system-status">✅</div>
+                    <small>يعمل بنجاح</small>
+                </div>
+            </div>
+
+            <div class="controls">
+                <button class="btn btn-telegram" onclick="testTelegram()">
+                    <span>📱</span> اختبار Telegram
+                </button>
+                <button class="btn btn-indicator" onclick="forceHourlyReport()">
+                    <span>⏰</span> إرسال تقرير ساعي
+                </button>
+                <button class="btn btn-indicator" onclick="refreshData()">
+                    <span>🔄</span> تحديث البيانات
+                </button>
+            </div>
+
+            <div class="card">
+                <h2 style="margin-bottom: 20px; color: #60a5fa; display: flex; align-items: center; gap: 10px;">
+                    <span>🎯</span> آخر الإشارات المتقدمة
+                </h2>
+                <div id="signals-container">
+                    <p style="text-align: center; opacity: 0.7; padding: 30px;">
+                        🔍 جاري البحث عن إشارات تداول قوية...
+                    </p>
+                </div>
+            </div>
+
+            <div style="text-align: center; margin-top: 40px; color: #94a3b8; font-size: 0.9rem; line-height: 1.6;">
+                <p>⚡ يعمل على Replit | 📊 3 مؤشرات فنية | 🔄 تحديث كل 5 دقائق</p>
+                <p>🎯 إشارات عند توافق المؤشرات | ⚠️ لأغراض تعليمية فقط</p>
+                <p style="margin-top: 10px; font-size: 0.8rem; opacity: 0.6;">
+                    RSI: مؤشر القوة النسبية | EMA: المتوسط المتحرك الأسي | MACD: مؤشر التقارب والتباعد للمتوسط المتحرك
+                </p>
+            </div>
+        </div>
+
+        <script>
+            function updateDashboard() {
+                fetch('/api/dashboard')
+                    .then(response => response.json())
+                    .then(data => {
+                        // تحديث الأسعار والمؤشرات
+                        const pricesContainer = document.getElementById('prices-container');
+                        let pricesHTML = '';
+
+                        const assets = [
+                            {key: 'gold', name: 'الذهب', symbol: 'XAUUSD', icon: '🧭'},
+                            {key: 'btc', name: 'البيتكوين', symbol: 'BTCUSD', icon: '₿'},
+                            {key: 'silver', name: 'الفضة', symbol: 'XAGUSD', icon: '🥈'}
+                        ];
+
+                        assets.forEach(asset => {
+                            const p = data.prices[asset.key];
+                            if (p.price === 0) return;
+
+                            const strengthClass = p.signal_strength >= 70 ? 'strength-high' : 
+                                                  p.signal_strength >= 50 ? 'strength-medium' : 'strength-low';
+                            const strengthPercent = Math.min(p.signal_strength, 100);
+                            
+                            // ألوان المؤشرات
+                            const rsiColor = p.rsi < 40 ? '#10b981' : p.rsi > 60 ? '#ef4444' : '#f59e0b';
+                            const emaColor = p.indicators.ema_trend === 'صاعد' ? '#10b981' : p.indicators.ema_trend === 'هابط' ? '#ef4444' : '#f59e0b';
+                            const macdColor = p.indicators.macd_trend === 'صاعد' ? '#10b981' : p.indicators.macd_trend === 'هابط' ? '#ef4444' : '#f59e0b';
+
+                            pricesHTML += `
+                                <div class="card">
+                                    <div class="time-badge">${data.last_update.split(' ')[1]}</div>
+                                    <div style="display: flex; align-items: center; margin-bottom: 15px;">
+                                        <span style="font-size: 2.5em; margin-right: 15px;">${asset.icon}</span>
+                                        <div>
+                                            <h3 style="margin: 0; font-size: 1.5rem;">${asset.name}</h3>
+                                            <small style="opacity: 0.7;">${asset.symbol}</small>
+                                        </div>
+                                    </div>
+                                    <div class="price">$${p.price.toLocaleString('en-US', {minimumFractionDigits: 2})}</div>
+                                    
+                                    <div style="margin: 20px 0;">
+                                        <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                            <span>💪 قوة الإشارة: ${p.signal_strength}/100</span>
+                                            <span>${p.indicators.signal_type === 'شراء' ? '🟢' : p.indicators.signal_type === 'بيع' ? '🔴' : '⚪'} ${p.indicators.signal_type}</span>
+                                        </div>
+                                        <div class="strength-meter">
+                                            <div class="strength-fill ${strengthClass}" style="width: ${strengthPercent}%"></div>
+                                        </div>
+                                        <div style="text-align: center; margin-top: 5px; font-size: 0.9rem; opacity: 0.8;">
+                                            ${p.indicators.buy_signals}/3 للشراء | ${p.indicators.sell_signals}/3 للبيع
+                                        </div>
+                                    </div>
+
+                                    <div class="indicators-grid">
+                                        <div class="indicator-box">
+                                            <div>📊 RSI</div>
+                                            <div class="indicator-value" style="color: ${rsiColor}">${p.rsi}</div>
+                                            <small style="color: ${rsiColor}">${p.indicators.rsi_trend}</small>
+                                        </div>
+                                        <div class="indicator-box">
+                                            <div>📈 EMA</div>
+                                            <div class="indicator-value" style="color: ${emaColor}">${p.indicators.ema_trend}</div>
+                                            <small>${p.ema_short.toFixed(2)}/${p.ema_long.toFixed(2)}</small>
+                                        </div>
+                                        <div class="indicator-box">
+                                            <div>🎯 MACD</div>
+                                            <div class="indicator-value" style="color: ${macdColor}">${p.indicators.macd_trend}</div>
+                                            <small>${p.macd.toFixed(4)}</small>
+                                        </div>
+                                    </div>
+
+                                    <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(255,255,255,0.1);">
+                                        <div style="display: flex; justify-content: space-between; font-size: 0.9rem;">
+                                            <span>📊 الاتجاه: ${p.trend}</span>
+                                            <span>🎯 ${p.indicators.buy_signals === 3 ? 'توافق كامل' : p.indicators.buy_signals >= 2 || p.indicators.sell_signals >= 2 ? 'توافق جزئي' : 'تعارض'}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            `;
+                        });
+
+                        pricesContainer.innerHTML = pricesHTML;
+
+                        // تحديث الإشارات
+                        const signalsContainer = document.getElementById('signals-container');
+                        if (data.signals.length === 0) {
+                            signalsContainer.innerHTML = `
+                                <div style="text-align: center; padding: 40px;">
+                                    <div style="font-size: 3em; opacity: 0.3; margin-bottom: 10px;">🔍</div>
+                                    <p style="opacity: 0.7; margin-bottom: 10px;">لا توجد إشارات قوية حالياً</p>
+                                    <small style="opacity: 0.5;">يتم إرسال إشارات فقط عند توافق المؤشرات وقوة > 70/100</small>
+                                </div>
+                            `;
+                        } else {
+                            let signalsHTML = '';
+                            data.signals.forEach(signal => {
+                                const signalClass = signal.action.includes('بيع') ? 'signal-sell' : 'signal-buy';
+                                const signalType = signal.action.includes('بيع') ? 'بيع' : 'شراء';
+                                const strengthColor = signal.strength_score >= 85 ? '#ef4444' : 
+                                                      signal.strength_score >= 75 ? '#f59e0b' : '#10b981';
+
+                                signalsHTML += `
+                                    <div class="signal-card ${signalClass}">
+                                        <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 15px;">
+                                            <div>
+                                                <h3 style="margin: 0; font-size: 1.3rem;">${signal.name} - ${signal.action}</h3>
+                                                <p style="margin: 5px 0 0 0; opacity: 0.8;">💰 $${signal.price.toLocaleString('en-US', {minimumFractionDigits: 2})}</p>
+                                            </div>
+                                            <div style="background: ${strengthColor}; padding: 8px 15px; border-radius: 20px; font-weight: bold; color: white;">
+                                                قوة: ${signal.strength_score}/100
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="signal-indicators">
+                                            <div class="signal-indicator" style="border-left: 3px solid ${signal.rsi < 40 ? '#10b981' : signal.rsi > 60 ? '#ef4444' : '#f59e0b'}">
+                                                📊 RSI: ${signal.rsi} (${signal.trend_rsi})
+                                            </div>
+                                            <div class="signal-indicator" style="border-left: 3px solid ${signal.trend_ema === 'صاعد' ? '#10b981' : signal.trend_ema === 'هابط' ? '#ef4444' : '#f59e0b'}">
+                                                📈 EMA: ${signal.trend_ema}
+                                            </div>
+                                            <div class="signal-indicator" style="border-left: 3px solid ${signal.trend_macd === 'صاعد' ? '#10b981' : signal.trend_macd === 'هابط' ? '#ef4444' : '#f59e0b'}">
+                                                🎯 MACD: ${signal.trend_macd}
+                                            </div>
+                                        </div>
+                                        
+                                        <p style="margin: 15px 0; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 8px; border-right: 3px solid currentColor;">
+                                            📝 ${signal.reason}
+                                        </p>
+                                        
+                                        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 15px; font-size: 0.9rem; opacity: 0.8;">
+                                            <div>
+                                                <span>🕒 ${signal.time}</span>
+                                                <span style="margin: 0 10px;">|</span>
+                                                <span>📅 ${signal.date}</span>
+                                            </div>
+                                            <div>
+                                                ${signal.buy_signals}/3 🟢 | ${signal.sell_signals}/3 🔴
+                                            </div>
+                                        </div>
+                                    </div>
+                                `;
+                            });
+                            signalsContainer.innerHTML = signalsHTML;
+                        }
+
+                        // تحديث الإحصائيات
+                        document.getElementById('signals-count').textContent = data.signals_today;
+                        document.getElementById('strength-avg').textContent = data.avg_strength.toFixed(1);
+                        document.getElementById('last-update').textContent = data.last_update.split(' ')[1];
+                        
+                    })
+                    .catch(error => {
+                        console.error('خطأ في تحديث البيانات:', error);
+                        document.getElementById('system-status').textContent = '❌';
+                        document.getElementById('system-status').style.color = '#ef4444';
+                    });
+            }
+
+            function testTelegram() {
+                fetch('/api/test-telegram')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            alert('✅ تم إرسال رسالة اختبار إلى Telegram!');
+                        } else {
+                            alert('⚠️ ' + data.message);
+                        }
+                    });
+            }
+
+            function forceHourlyReport() {
+                fetch('/api/hourly-report')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            alert('✅ تم إرسال التقرير الساعي!');
+                        } else {
+                            alert('⚠️ ' + data.message);
+                        }
+                    });
+            }
+
+            function refreshData() {
+                fetch('/api/refresh-prices')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            updateDashboard();
+                            alert('✅ تم تحديث البيانات بنجاح!');
+                        } else {
+                            alert('⚠️ ' + data.message);
+                        }
+                    });
+            }
+
+            // تحديث كل 30 ثانية
+            setInterval(updateDashboard, 30000);
+
+            // تحديث أولي
+            updateDashboard();
+
+            // تحديث الوقت الحالي
+            function updateCurrentTime() {
+                const now = new Date();
+                const timeString = now.toLocaleTimeString('ar-EG');
+                document.getElementById('last-update').textContent = timeString;
+            }
+
+            setInterval(updateCurrentTime, 1000);
+            updateCurrentTime();
+        </script>
+    </body>
+    </html>
+    '''
+    return render_template_string(html)
+
+# ================== API النقاط ==================
+
+@app.route('/api/dashboard')
+def api_advanced_dashboard():
+    """بيانات لوحة التحكم المتقدمة"""
+    with signal_lock:
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_signals = [s for s in trading_signals if s.get('date') == today]
+
+        # حساب متوسط قوة الإشارات
+        avg_strength = 0
+        if today_signals:
+            strengths = [s.get('strength_score', 0) for s in today_signals]
+            avg_strength = sum(strengths) / len(strengths)
+
+    return jsonify({
+        'prices': current_prices,
+        'signals': trading_signals[-5:][::-1],  # آخر 5 إشارات
+        'signals_today': len(today_signals),
+        'avg_strength': avg_strength,
+        'last_update': datetime.now().strftime("%H:%M:%S"),
+        'status': 'running',
+        'telegram_enabled': TELEGRAM_ENABLED,
+        'indicators_config': {
+            'rsi_period': 14,
+            'ema_short': 12,
+            'ema_long': 26,
+            'macd_fast': 12,
+            'macd_slow': 26,
+            'macd_signal': 9
+        }
+    })
+
+@app.route('/api/test-telegram')
+def test_telegram_advanced():
+    """اختبار Telegram مع معلومات المؤشرات"""
+    try:
+        test_msg = f"""✅ <b>اختبار البوت المتقدم</b>
+
+🤖 <b>الإصدار المتقدم يعمل بنجاح!</b>
+
+📊 <b>المؤشرات المستخدمة:</b>
+• 📊 RSI (14 فترة) - لتحديد التشبع
+• 📈 EMA (12/26) - لتحديد الاتجاه
+• 🎯 MACD (12,26,9) - للزخم
+
+🎯 <b>إعدادات الإشارات:</b>
+• قوة الإشارة الدنيا: {MIN_SIGNAL_STRENGTH}/100
+• تحديث الأسعار: كل {PRICE_UPDATE_INTERVAL//60} دقائق
+• تقرير ساعي: كل {HOURLY_REPORT_INTERVAL//3600} ساعة
+
+⏰ {datetime.now().strftime("%H:%M:%S")}
+📅 {datetime.now().strftime("%Y-%m-%d")}
+
+#اختبار #بوت_متقدم #مؤشرات_فنية"""
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': test_msg,
+            'parse_mode': 'HTML'
+        }
+        response = requests.post(url, json=data, timeout=10)
+
+        if response.status_code == 200:
+            return jsonify({'success': True, 'message': 'تم إرسال رسالة الاختبار'})
+        else:
+            return jsonify({'success': False, 'message': f'خطأ: {response.status_code}'})
+
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/hourly-report')
+def send_advanced_hourly_report():
+    """إرسال تقرير ساعي يدوياً"""
+    global last_hourly_report
+
+    try:
+        last_hourly_report = datetime.now() - timedelta(seconds=HOURLY_REPORT_INTERVAL)
+        
+        if bot.send_hourly_report():
+            return jsonify({'success': True, 'message': 'تم إرسال التقرير الساعي'})
+        else:
+            return jsonify({'success': False, 'message': 'فشل إرسال التقرير'})
+
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/refresh-prices')
+def refresh_prices():
+    """تحديث الأسعار يدوياً"""
+    try:
+        success = bot.update_all_prices_with_indicators()
+        if success:
+            return jsonify({'success': True, 'message': 'تم تحديث الأسعار والمؤشرات'})
+        else:
+            return jsonify({'success': False, 'message': 'فشل تحديث الأسعار'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/health')
+def health_check_advanced():
+    """فحص حالة النظام المتقدم"""
+    with signal_lock:
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_signals = [s for s in trading_signals if s.get('date') == today]
+
+    # حساب حالة المؤشرات
+    indicator_status = {}
+    for asset, data in current_prices.items():
+        if data['price'] > 0:
+            indicator_status[asset] = {
+                'rsi': data['rsi'],
+                'ema_status': data['indicators']['ema_trend'],
+                'macd_status': data['indicators']['macd_trend'],
+                'signal_strength': data['signal_strength']
+            }
+
+    return jsonify({
+        'status': 'running',
+        'timestamp': datetime.now().isoformat(),
+        'signals_today': len(today_signals),
+        'telegram_enabled': TELEGRAM_ENABLED,
+        'indicators': {
+            'rsi': 'active',
+            'ema': 'active',
+            'macd': 'active'
+        },
+        'min_signal_strength': MIN_SIGNAL_STRENGTH,
+        'price_update_interval': PRICE_UPDATE_INTERVAL,
+        'hourly_report_interval': HOURLY_REPORT_INTERVAL,
+        'indicator_status': indicator_status
+    })
+
+# ================== التشغيل ==================
+
+if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("🔥 بوت التداول الذكي - الإصدار المتقدم")
+    print("=" * 60)
+    print("📊 إعدادات المؤشرات:")
+    print(f"   • 📊 RSI: {bot.rsi_period} فترة")
+    print(f"   • 📈 EMA: {bot.ema_short_period}/{bot.ema_long_period} فترة")
+    print(f"   • 🎯 MACD: {bot.macd_fast}/{bot.macd_slow}/{bot.macd_signal_period}")
+    print("⚙️ إعدادات التشغيل:")
+    print(f"   • ⏰ تقرير ساعي: كل {HOURLY_REPORT_INTERVAL//3600} ساعة")
+    print(f"   • 🎯 قوة الإشارة الدنيا: {MIN_SIGNAL_STRENGTH}/100")
+    print(f"   • 📈 تحديث الأسعار: كل {PRICE_UPDATE_INTERVAL//60} دقائق")
+    print(f"   • 🤖 Telegram: {'مفعل' if TELEGRAM_ENABLED else 'معطل'}")
+    print("=" * 60)
+
+    # بدء البوت في thread
+    bot_thread = Thread(target=bot.run, daemon=True)
+    bot_thread.start()
+
+    # تشغيل خادم الويب
+    port = int(os.environ.get("PORT", 5000))
+    print(f"\n🌐 واجهة الويب: http://0.0.0.0:{port}")
+    print("📱 افتح الرابط في المتصفح")
+    print("🤖 جاري إرسال رسالة بدء التشغيل...")
+    print("=" * 60)
+
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
